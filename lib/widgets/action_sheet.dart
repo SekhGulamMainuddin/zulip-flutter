@@ -29,6 +29,7 @@ import 'page.dart';
 import 'store.dart';
 import 'text.dart';
 import 'theme.dart';
+import 'topic_list.dart';
 
 void _showActionSheet(
   BuildContext context, {
@@ -175,22 +176,41 @@ void showChannelActionSheet(BuildContext context, {
   final pageContext = PageRoot.contextOf(context);
   final store = PerAccountStoreWidget.of(pageContext);
 
-  final optionButtons = <ActionSheetMenuItemButton>[];
+  final optionButtons = <ActionSheetMenuItemButton>[
+    TopicListButton(pageContext: pageContext, channelId: channelId),
+  ];
+
   final unreadCount = store.unreads.countInChannelNarrow(channelId);
   if (unreadCount > 0) {
     optionButtons.add(
       MarkChannelAsReadButton(pageContext: pageContext, channelId: channelId));
   }
-  if (optionButtons.isEmpty) {
-    // TODO(a11y): This case makes a no-op gesture handler; as a consequence,
-    //   we're presenting some UI (to people who use screen-reader software) as
-    //   though it offers a gesture interaction that it doesn't meaningfully
-    //   offer, which is confusing. The solution here is probably to remove this
-    //   is-empty case by having at least one button that's always present,
-    //   such as "copy link to channel".
-    return;
-  }
+
   _showActionSheet(pageContext, optionButtons: optionButtons);
+}
+
+class TopicListButton extends ActionSheetMenuItemButton {
+  const TopicListButton({
+    super.key,
+    required this.channelId,
+    required super.pageContext,
+  });
+
+  final int channelId;
+
+  @override
+  IconData get icon => ZulipIcons.topics;
+
+  @override
+  String label(ZulipLocalizations zulipLocalizations) {
+    return zulipLocalizations.actionSheetOptionListOfTopics;
+  }
+
+  @override
+  void onPressed() {
+    Navigator.push(pageContext,
+      TopicListPage.buildRoute(context: pageContext, streamId: channelId));
+  }
 }
 
 class MarkChannelAsReadButton extends ActionSheetMenuItemButton {
@@ -555,6 +575,8 @@ void showMessageActionSheet({required BuildContext context, required Message mes
   final pageContext = PageRoot.contextOf(context);
   final store = PerAccountStoreWidget.of(pageContext);
 
+  final popularEmojiLoaded = store.popularEmojiCandidates().isNotEmpty;
+
   // The UI that's conditioned on this won't live-update during this appearance
   // of the action sheet (we avoid calling composeBoxControllerOf in a build
   // method; see its doc).
@@ -567,13 +589,19 @@ void showMessageActionSheet({required BuildContext context, required Message mes
   final markAsUnreadSupported = store.zulipFeatureLevel >= 155; // TODO(server-6)
   final showMarkAsUnreadButton = markAsUnreadSupported && isMessageRead;
 
+  final isSenderMuted = store.isUserMuted(message.senderId);
+
   final optionButtons = [
-    ReactionButtons(message: message, pageContext: pageContext),
+    if (popularEmojiLoaded)
+      ReactionButtons(message: message, pageContext: pageContext),
     StarButton(message: message, pageContext: pageContext),
     if (isComposeBoxOffered)
       QuoteAndReplyButton(message: message, pageContext: pageContext),
     if (showMarkAsUnreadButton)
       MarkAsUnreadButton(message: message, pageContext: pageContext),
+    if (isSenderMuted)
+      // The message must have been revealed in order to open this action sheet.
+      UnrevealMutedMessageButton(message: message, pageContext: pageContext),
     CopyMessageTextButton(message: message, pageContext: pageContext),
     CopyMessageLinkButton(message: message, pageContext: pageContext),
     ShareButton(message: message, pageContext: pageContext),
@@ -698,11 +726,18 @@ class ReactionButtons extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    assert(EmojiStore.popularEmojiCandidates.every(
+    final store = PerAccountStoreWidget.of(pageContext);
+    final popularEmojiCandidates = store.popularEmojiCandidates();
+    assert(popularEmojiCandidates.every(
       (emoji) => emoji.emojiType == ReactionType.unicodeEmoji));
+    // (if this is empty, the widget isn't built in the first place)
+    assert(popularEmojiCandidates.isNotEmpty);
+    // UI not designed to handle more than 6 popular emoji.
+    // (We might have fewer if ServerEmojiData is lacking expected data,
+    // but that looks fine in manual testing, even when there's just one.)
+    assert(popularEmojiCandidates.length <= 6);
 
     final zulipLocalizations = ZulipLocalizations.of(context);
-    final store = PerAccountStoreWidget.of(pageContext);
     final designVariables = DesignVariables.of(context);
 
     bool hasSelfVote(EmojiCandidate emoji) {
@@ -718,7 +753,7 @@ class ReactionButtons extends StatelessWidget {
         color: designVariables.contextMenuItemBg.withFadedAlpha(0.12)),
       child: Row(children: [
         Flexible(child: Row(spacing: 1, children: List.unmodifiable(
-          EmojiStore.popularEmojiCandidates.mapIndexed((index, emoji) =>
+          popularEmojiCandidates.mapIndexed((index, emoji) =>
             _buildButton(
               context: context,
               emoji: emoji,
@@ -803,7 +838,7 @@ class QuoteAndReplyButton extends MessageActionSheetMenuItemButton {
 
   @override
   String label(ZulipLocalizations zulipLocalizations) {
-    return zulipLocalizations.actionSheetOptionQuoteAndReply;
+    return zulipLocalizations.actionSheetOptionQuoteMessage;
   }
 
   @override void onPressed() async {
@@ -866,9 +901,35 @@ class MarkAsUnreadButton extends MessageActionSheetMenuItemButton {
   }
 
   @override void onPressed() async {
-    final narrow = findMessageListPage().narrow;
+    final messageListPage = findMessageListPage();
     unawaited(ZulipAction.markNarrowAsUnreadFromMessage(pageContext,
-      message, narrow));
+      message, messageListPage.narrow));
+    // TODO should we alert the user about this change somehow? A snackbar?
+    messageListPage.markReadOnScroll = false;
+  }
+}
+
+class UnrevealMutedMessageButton extends MessageActionSheetMenuItemButton {
+  UnrevealMutedMessageButton({
+    super.key,
+    required super.message,
+    required super.pageContext,
+  });
+
+  @override
+  IconData get icon => ZulipIcons.eye_off;
+
+  @override
+  String label(ZulipLocalizations zulipLocalizations) {
+    return zulipLocalizations.actionSheetOptionHideMutedMessage;
+  }
+
+  @override
+  void onPressed() {
+    // The message should have been revealed in order to reach this action sheet.
+    assert(MessageListPage.revealedMutedMessagesOf(pageContext)
+      .isMutedMessageRevealed(message.id));
+    findMessageListPage().unrevealMutedMessage(message.id);
   }
 }
 

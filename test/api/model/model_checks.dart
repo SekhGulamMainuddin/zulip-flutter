@@ -21,6 +21,13 @@ extension UserChecks on Subject<User> {
   Subject<bool> get isSystemBot => has((x) => x.isSystemBot, 'isSystemBot');
 }
 
+extension SavedSnippetChecks on Subject<SavedSnippet> {
+  Subject<int> get id => has((x) => x.id, 'id');
+  Subject<String> get title => has((x) => x.title, 'title');
+  Subject<String> get content => has((x) => x.content, 'content');
+  Subject<int> get dateCreated => has((x) => x.dateCreated, 'dateCreated');
+}
+
 extension ZulipStreamChecks on Subject<ZulipStream> {
 }
 
@@ -30,7 +37,13 @@ extension TopicNameChecks on Subject<TopicName> {
 }
 
 extension StreamConversationChecks on Subject<StreamConversation> {
+  Subject<int> get streamId => has((x) => x.streamId, 'streamId');
+  Subject<TopicName> get topic => has((x) => x.topic, 'topic');
   Subject<String?> get displayRecipient => has((x) => x.displayRecipient, 'displayRecipient');
+}
+
+extension DmConversationChecks on Subject<DmConversation> {
+  Subject<List<int>> get allRecipientIds => has((x) => x.allRecipientIds, 'allRecipientIds');
 }
 
 extension MessageBaseChecks<T extends Conversation> on Subject<MessageBase<T>> {
@@ -56,8 +69,6 @@ extension MessageChecks on Subject<Message> {
   Subject<Poll?> get poll => has((e) => e.poll, 'poll');
   Subject<String> get type => has((e) => e.type, 'type');
   Subject<List<MessageFlag>> get flags => has((e) => e.flags, 'flags');
-  Subject<String?> get matchContent => has((e) => e.matchContent, 'matchContent');
-  Subject<String?> get matchTopic => has((e) => e.matchTopic, 'matchTopic');
 }
 
 extension StreamMessageChecks on Subject<StreamMessage> {

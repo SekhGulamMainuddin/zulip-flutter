@@ -41,6 +41,7 @@ import '../model/binding.dart';
 import '../model/test_store.dart';
 import '../stdlib_checks.dart';
 import '../test_clipboard.dart';
+import '../test_images.dart';
 import '../test_share_plus.dart';
 import 'compose_box_checks.dart';
 import 'dialog_checks.dart';
@@ -53,11 +54,17 @@ late FakeApiConnection connection;
 Future<void> setupToMessageActionSheet(WidgetTester tester, {
   required Message message,
   required Narrow narrow,
+  User? sender,
+  List<int>? mutedUserIds,
   bool? realmAllowMessageEditing,
   int? realmMessageContentEditLimitSeconds,
+  bool shouldSetServerEmojiData = true,
+  bool useLegacyServerEmojiData = false,
+  Future<void> Function()? beforeLongPress,
 }) async {
   addTearDown(testBinding.reset);
-  assert(narrow.containsMessage(message));
+  // TODO(#1667) will be null in a search narrow; remove `!`.
+  assert(narrow.containsMessage(message)!);
 
   await testBinding.globalStore.add(
     eg.selfAccount,
@@ -68,16 +75,24 @@ Future<void> setupToMessageActionSheet(WidgetTester tester, {
   store = await testBinding.globalStore.perAccount(eg.selfAccount.id);
   await store.addUsers([
     eg.selfUser,
-    eg.user(userId: message.senderId),
+    sender ?? eg.user(userId: message.senderId),
     if (narrow is DmNarrow)
       ...narrow.otherRecipientIds.map((id) => eg.user(userId: id)),
   ]);
+  if (mutedUserIds != null) {
+    await store.setMutedUsers(mutedUserIds);
+  }
   if (message is StreamMessage) {
     final stream = eg.stream(streamId: message.streamId);
     await store.addStream(stream);
     await store.addSubscription(eg.subscription(stream));
   }
   connection = store.connection as FakeApiConnection;
+  if (shouldSetServerEmojiData) {
+    store.setServerEmojiData(useLegacyServerEmojiData
+      ? eg.serverEmojiDataPopularLegacy
+      : eg.serverEmojiDataPopular);
+  }
 
   connection.prepare(json: eg.newestGetMessagesResult(
     foundOldest: true, messages: [message]).toJson());
@@ -86,6 +101,8 @@ Future<void> setupToMessageActionSheet(WidgetTester tester, {
 
   // global store, per-account store, and message list get loaded
   await tester.pumpAndSettle();
+
+  await beforeLongPress?.call();
 
   // Request the message action sheet.
   //
@@ -107,6 +124,7 @@ Future<void> setupToMessageActionSheet(WidgetTester tester, {
 void main() {
   TestZulipBinding.ensureInitialized();
   TestWidgetsFlutterBinding.ensureInitialized();
+  MessageListPage.debugEnableMarkReadOnScroll = false;
 
   void prepareRawContentResponseSuccess({
     required Message message,
@@ -219,6 +237,7 @@ void main() {
     group('showChannelActionSheet', () {
       void checkButtons() {
         check(actionSheetFinder).findsOne();
+        checkButton('List of topics');
         checkButton('Mark channel as read');
       }
 
@@ -237,7 +256,7 @@ void main() {
       testWidgets('show with no unread messages', (tester) async {
         await prepare(hasUnreadMessages: false);
         await showFromSubscriptionList(tester);
-        check(actionSheetFinder).findsNothing();
+        check(findButtonForLabel('Mark channel as read')).findsNothing();
       });
 
       testWidgets('show from app bar in channel narrow', (tester) async {
@@ -259,6 +278,19 @@ void main() {
         await showFromRecipientHeader(tester, message: someMessage);
         checkButtons();
       });
+    });
+
+    testWidgets('TopicListButton', (tester) async {
+      await prepare();
+      await showFromAppBar(tester,
+        narrow: ChannelNarrow(someChannel.streamId));
+
+      connection.prepare(json: GetStreamTopicsResult(topics: [
+        eg.getStreamTopicsEntry(name: 'some topic foo'),
+      ]).toJson());
+      await tester.tap(findButtonForLabel('List of topics'));
+      await tester.pumpAndSettle();
+      check(find.text('some topic foo')).findsOne();
     });
 
     group('MarkChannelAsReadButton', () {
@@ -829,72 +861,96 @@ void main() {
 
   group('message action sheet', () {
     group('ReactionButtons', () {
-      final popularCandidates = EmojiStore.popularEmojiCandidates;
+      testWidgets('absent if ServerEmojiData not loaded', (tester) async {
+        final message = eg.streamMessage();
+        await setupToMessageActionSheet(tester,
+          message: message,
+          narrow: TopicNarrow.ofMessage(message),
+          shouldSetServerEmojiData: false);
+        check(find.byType(ReactionButtons)).findsNothing();
+      });
 
-      for (final emoji in popularCandidates) {
-        final emojiDisplay = emoji.emojiDisplay as UnicodeEmojiDisplay;
+      for (final useLegacy in [false, true]) {
+        final popularCandidates =
+          (eg.store()..setServerEmojiData(
+            useLegacy
+              ? eg.serverEmojiDataPopularLegacy
+              : eg.serverEmojiDataPopular))
+            .popularEmojiCandidates();
+        for (final emoji in popularCandidates) {
+          final emojiDisplay = emoji.emojiDisplay as UnicodeEmojiDisplay;
 
-        Future<void> tapButton(WidgetTester tester) async {
-          await tester.tap(find.descendant(
-            of: find.byType(BottomSheet),
-            matching: find.text(emojiDisplay.emojiUnicode)));
+          Future<void> tapButton(WidgetTester tester) async {
+            await tester.tap(find.descendant(
+              of: find.byType(BottomSheet),
+              matching: find.text(emojiDisplay.emojiUnicode)));
+          }
+
+          testWidgets('${emoji.emojiName} adding success; useLegacy: $useLegacy', (tester) async {
+            final message = eg.streamMessage();
+            await setupToMessageActionSheet(tester,
+              message: message,
+              narrow: TopicNarrow.ofMessage(message),
+              useLegacyServerEmojiData: useLegacy);
+
+            connection.prepare(json: {});
+            await tapButton(tester);
+            await tester.pump(Duration.zero);
+
+            check(connection.lastRequest).isA<http.Request>()
+              ..method.equals('POST')
+              ..url.path.equals('/api/v1/messages/${message.id}/reactions')
+              ..bodyFields.deepEquals({
+                  'reaction_type': 'unicode_emoji',
+                  'emoji_code': emoji.emojiCode,
+                  'emoji_name': emoji.emojiName,
+                });
+          });
+
+          testWidgets('${emoji.emojiName} removing success; useLegacy: $useLegacy', (tester) async {
+            final message = eg.streamMessage(
+              reactions: [Reaction(
+                emojiName: emoji.emojiName,
+                emojiCode: emoji.emojiCode,
+                reactionType: ReactionType.unicodeEmoji,
+                userId: eg.selfAccount.userId)]
+            );
+            await setupToMessageActionSheet(tester,
+              message: message,
+              narrow: TopicNarrow.ofMessage(message),
+              useLegacyServerEmojiData: useLegacy);
+
+            connection.prepare(json: {});
+            await tapButton(tester);
+            await tester.pump(Duration.zero);
+
+            check(connection.lastRequest).isA<http.Request>()
+              ..method.equals('DELETE')
+              ..url.path.equals('/api/v1/messages/${message.id}/reactions')
+              ..bodyFields.deepEquals({
+                  'reaction_type': 'unicode_emoji',
+                  'emoji_code': emoji.emojiCode,
+                  'emoji_name': emoji.emojiName,
+                });
+          });
+
+          testWidgets('${emoji.emojiName} request has an error; useLegacy: $useLegacy', (tester) async {
+            final message = eg.streamMessage();
+            await setupToMessageActionSheet(tester,
+              message: message,
+              narrow: TopicNarrow.ofMessage(message),
+              useLegacyServerEmojiData: useLegacy);
+
+            connection.prepare(
+              apiException: eg.apiBadRequest(message: 'Invalid message(s)'));
+            await tapButton(tester);
+            await tester.pump(Duration.zero); // error arrives; error dialog shows
+
+            await tester.tap(find.byWidget(checkErrorDialog(tester,
+              expectedTitle: 'Adding reaction failed',
+              expectedMessage: 'Invalid message(s)')));
+          });
         }
-
-        testWidgets('${emoji.emojiName} adding success', (tester) async {
-          final message = eg.streamMessage();
-          await setupToMessageActionSheet(tester, message: message, narrow: TopicNarrow.ofMessage(message));
-
-          connection.prepare(json: {});
-          await tapButton(tester);
-          await tester.pump(Duration.zero);
-
-          check(connection.lastRequest).isA<http.Request>()
-            ..method.equals('POST')
-            ..url.path.equals('/api/v1/messages/${message.id}/reactions')
-            ..bodyFields.deepEquals({
-                'reaction_type': 'unicode_emoji',
-                'emoji_code': emoji.emojiCode,
-                'emoji_name': emoji.emojiName,
-              });
-        });
-
-        testWidgets('${emoji.emojiName} removing success', (tester) async {
-          final message = eg.streamMessage(
-            reactions: [Reaction(
-              emojiName: emoji.emojiName,
-              emojiCode: emoji.emojiCode,
-              reactionType: ReactionType.unicodeEmoji,
-              userId: eg.selfAccount.userId)]
-          );
-          await setupToMessageActionSheet(tester, message: message, narrow: TopicNarrow.ofMessage(message));
-
-          connection.prepare(json: {});
-          await tapButton(tester);
-          await tester.pump(Duration.zero);
-
-          check(connection.lastRequest).isA<http.Request>()
-            ..method.equals('DELETE')
-            ..url.path.equals('/api/v1/messages/${message.id}/reactions')
-            ..bodyFields.deepEquals({
-                'reaction_type': 'unicode_emoji',
-                'emoji_code': emoji.emojiCode,
-                'emoji_name': emoji.emojiName,
-              });
-        });
-
-        testWidgets('${emoji.emojiName} request has an error', (tester) async {
-          final message = eg.streamMessage();
-          await setupToMessageActionSheet(tester, message: message, narrow: TopicNarrow.ofMessage(message));
-
-          connection.prepare(
-            apiException: eg.apiBadRequest(message: 'Invalid message(s)'));
-          await tapButton(tester);
-          await tester.pump(Duration.zero); // error arrives; error dialog shows
-
-          await tester.tap(find.byWidget(checkErrorDialog(tester,
-            expectedTitle: 'Adding reaction failed',
-            expectedMessage: 'Invalid message(s)')));
-        });
       }
     });
 
@@ -1286,6 +1342,79 @@ void main() {
             expectedTitle: zulipLocalizations.errorMarkAsUnreadFailedTitle,
             expectedMessage: 'NetworkException: Oops (ClientException: Oops)');
         });
+      });
+    });
+
+    group('UnrevealMutedMessageButton', () {
+      final user = eg.user(userId: 1, fullName: 'User', avatarUrl: '/foo.png');
+      final message = eg.streamMessage(sender: user,
+        content: '<p>A message</p>', reactions: [eg.unicodeEmojiReaction]);
+
+      final revealButtonFinder = find.widgetWithText(ZulipWebUiKitButton,
+        'Reveal message');
+
+      final contentFinder = find.descendant(
+        of: find.byType(MessageContent),
+        matching: find.text('A message', findRichText: true));
+
+      testWidgets('not visible if message is from normal sender (not muted)', (tester) async {
+        prepareBoringImageHttpClient();
+
+        await setupToMessageActionSheet(tester,
+          message: message,
+          narrow: const CombinedFeedNarrow(),
+          sender: user);
+        check(store.isUserMuted(user.userId)).isFalse();
+
+        check(find.byIcon(ZulipIcons.eye_off, skipOffstage: false)).findsNothing();
+
+        debugNetworkImageHttpClientProvider = null;
+      });
+
+      testWidgets('visible if message is from muted sender and revealed', (tester) async {
+        prepareBoringImageHttpClient();
+
+        await setupToMessageActionSheet(tester,
+          message: message,
+          narrow: const CombinedFeedNarrow(),
+          sender: user,
+          mutedUserIds: [user.userId],
+          beforeLongPress: () async {
+            check(contentFinder).findsNothing();
+            await tester.tap(revealButtonFinder);
+            await tester.pump();
+            check(contentFinder).findsOne();
+          },
+        );
+
+        check(find.byIcon(ZulipIcons.eye_off, skipOffstage: false)).findsOne();
+
+        debugNetworkImageHttpClientProvider = null;
+      });
+
+      testWidgets('when pressed, unreveals the message', (tester) async {
+        prepareBoringImageHttpClient();
+
+        await setupToMessageActionSheet(tester,
+          message: message,
+          narrow: const CombinedFeedNarrow(),
+          sender: user,
+          mutedUserIds: [user.userId],
+          beforeLongPress: () async {
+            check(contentFinder).findsNothing();
+            await tester.tap(revealButtonFinder);
+            await tester.pump();
+            check(contentFinder).findsOne();
+          });
+
+        await tester.ensureVisible(find.byIcon(ZulipIcons.eye_off, skipOffstage: false));
+        await tester.tap(find.byIcon(ZulipIcons.eye_off));
+        await tester.pumpAndSettle();
+
+        check(contentFinder).findsNothing();
+        check(revealButtonFinder).findsOne();
+
+        debugNetworkImageHttpClientProvider = null;
       });
     });
 
